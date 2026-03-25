@@ -400,18 +400,7 @@ def eval_val(args, model, rank, world_size, device, grad_accum_steps,
                 token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
                 token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
                 val_byte_count += token_bytes.to(torch.float64).sum()
-                train_loss.backward()
-                ttt_opt.step()
-                ttt_opt.zero_grad(set_to_none=True)
 
-            batch_token_count = float(y.numel())
-            val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
-            val_token_count += batch_token_count
-            prev_ids = x.reshape(-1)
-            tgt_ids = y.reshape(-1)
-            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
-            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
-            val_byte_count += token_bytes.to(torch.float64).sum()
             if log_fn is not None and total_batches > 1 and (batch_idx == 1 or batch_idx == total_batches or batch_idx % 25 == 0):
                 run_loss = float((val_loss_sum / val_token_count).item())
                 run_bpb = (run_loss / math.log(2.0)) * float((val_token_count / val_byte_count).item()) if float(val_byte_count.item()) > 0 else 0.0
