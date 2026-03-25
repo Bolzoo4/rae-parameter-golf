@@ -354,27 +354,52 @@ def eval_val(args, model, rank, world_size, device, grad_accum_steps,
             raw_start = batch_seq_start * args.train_seq_len
             raw_end = batch_seq_end * args.train_seq_len + 1
             local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
-            x = local[:-1].reshape(-1, args.train_seq_len)
-            y = local[1:].reshape(-1, args.train_seq_len)
+            eval_stride = int(os.environ.get("EVAL_STRIDE", args.train_seq_len))
             
-            model.eval()
-            if ttt_mode == "none":
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    batch_loss = model(x, y).detach()
-            else:
-                with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    batch_loss = model(x, y).detach()
+            # Sliding Window Evaluation logic
+            for start_idx in range(0, local.size(0) - args.train_seq_len, eval_stride):
+                end_idx = start_idx + args.train_seq_len
+                x_win = local[start_idx:end_idx].unsqueeze(0)
+                y_win = local[start_idx+1:end_idx+1].unsqueeze(0)
                 
-                # Perform TTT update on the block AFTER evaluating it 
-                model.train()
-                if "cosine" in ttt_mode:
-                    progress = (batch_idx - 1) / total_batches
-                    current_lr = ttt_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
-                    for group in ttt_opt.param_groups:
-                        group["lr"] = current_lr
+                model.eval()
+                # 1. Evaluate current window
+                if ttt_mode == "none":
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                        # Cross entropy already averages over seq_len, we take the mean
+                        batch_loss = model(x_win, y_win).detach()
+                else:
+                    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                        batch_loss = model(x_win, y_win).detach()
+                    
+                    # 2. Test-Time Training (TTT) update
+                    model.train()
+                    if "cosine" in ttt_mode:
+                        progress = (batch_idx - 1) / total_batches
+                        current_lr = ttt_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
+                        for group in ttt_opt.param_groups:
+                            group["lr"] = current_lr
+                    
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                        train_loss = model(x_win, y_win)
+                    train_loss.backward()
+                    ttt_opt.step()
+                    ttt_opt.zero_grad(set_to_none=True)
+
+                # 3. Accumulate stats (we only count the bits for the NEW tokens if sliding, or all if not)
+                # For simplicity and to match PR #192, we average over the whole window if stride == seq_len
+                # For proper SWE, one should only count the contribution of the last 'stride' tokens.
+                # Here we use the full window loss but weight by stride count to preserve proportions.
+                current_tokens_count = float(eval_stride)
+                val_loss_sum += batch_loss.to(torch.float64) * current_tokens_count
+                val_token_count += current_tokens_count
                 
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    train_loss = model(x, y)
+                # Precise byte count for the stride
+                prev_ids = x_win[:, -eval_stride:].reshape(-1)
+                tgt_ids = y_win[:, -eval_stride:].reshape(-1)
+                token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+                token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+                val_byte_count += token_bytes.to(torch.float64).sum()
                 train_loss.backward()
                 ttt_opt.step()
                 ttt_opt.zero_grad(set_to_none=True)
@@ -716,13 +741,7 @@ class RAE(nn.Module):
         
         for t in range(self.num_recur_steps):
             beta = self._beta(t)
-            if self.training and self.num_recur_steps > 1:
-                x = torch.utils.checkpoint.checkpoint(
-                    functools.partial(self.block, beta=beta),
-                    x, use_reentrant=False,
-                )
-            else:
-                x = self.block(x, beta)
+            x = self.block(x, beta)
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         logits_proj = F.linear(x, self.tok_emb.weight)
@@ -950,7 +969,7 @@ def main() -> None:
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
-        if args.train_log_every > 0 and (step % args.train_log_every == 0 or step <= 10 or stop_after_step is not None):
+        if args.train_log_every > 0 and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None):
             log0(f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                  f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms")
 
