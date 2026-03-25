@@ -322,7 +322,7 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
 
 def eval_val(args, model, rank, world_size, device, grad_accum_steps,
              val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-             log_fn=None):
+             log_fn=None, **kwargs):
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
     if local_batch_tokens < args.train_seq_len:
         raise ValueError(f"VAL_BATCH_SIZE too small: {args.val_batch_size}")
@@ -355,9 +355,12 @@ def eval_val(args, model, rank, world_size, device, grad_accum_steps,
             raw_end = batch_seq_end * args.train_seq_len + 1
             local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
             eval_stride = int(os.environ.get("EVAL_STRIDE", args.train_seq_len))
+            # Use SWE ONLY on the final step (last_step) or if explicitly forced to save time
+            is_final_eval = kwargs.get("is_final_eval", False)
+            actual_stride = eval_stride if is_final_eval else args.train_seq_len
             
             # Sliding Window Evaluation logic
-            for start_idx in range(0, local.size(0) - args.train_seq_len, eval_stride):
+            for start_idx in range(0, local.size(0) - args.train_seq_len, actual_stride):
                 end_idx = start_idx + args.train_seq_len
                 x_win = local[start_idx:end_idx].unsqueeze(0)
                 y_win = local[start_idx+1:end_idx+1].unsqueeze(0)
@@ -909,11 +912,12 @@ def main() -> None:
     step = 0
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
-        if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+        if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)) and (step > 0 or not os.environ.get("SKIP_INITIAL_EVAL")):
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
             val_loss, val_bpb = eval_val(args, model, rank, world_size, device, grad_accum_steps,
-                                          val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut, log_fn=log0)
+                                          val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut, 
+                                          log_fn=log0, is_final_eval=last_step)
             log0(f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                  f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms")
             torch.cuda.synchronize()
