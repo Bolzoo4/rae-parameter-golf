@@ -668,8 +668,8 @@ class RecursiveBlock(nn.Module):
         self.hopfield = HopfieldLayer(dim, num_patterns)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.hop_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.attn_gate = nn.Parameter(torch.zeros(1, dtype=torch.float32))
-        self.hop_gate = nn.Parameter(torch.zeros(1, dtype=torch.float32))
+        self.attn_gate = nn.Parameter(torch.full((1,), -2.0, dtype=torch.float32))
+        self.hop_gate = nn.Parameter(torch.full((1,), -2.0, dtype=torch.float32))
 
     def forward(self, x: Tensor, beta: float) -> Tensor:
         gate_a = torch.sigmoid(self.attn_gate).to(x.dtype)
@@ -963,7 +963,7 @@ def main() -> None:
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
-        if args.train_log_every > 0 and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None):
+        if args.train_log_every > 0 and (step % args.train_log_every == 0 or stop_after_step is not None):
             log0(f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                  f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms")
 
