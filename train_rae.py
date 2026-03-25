@@ -674,13 +674,14 @@ class RecursiveBlock(nn.Module):
         self.hop_norm = RMSNorm()
         self.attn = LatentAttention(dim, num_heads, num_kv_heads, latent_dim, rope_dim, rope_base, qk_gain_init)
         self.hopfield = HopfieldLayer(dim, num_patterns)
-        self.attn_scale = nn.Parameter(torch.ones(1, 1, dim, dtype=torch.float32))
-        self.hop_scale = nn.Parameter(torch.ones(1, 1, dim, dtype=torch.float32))
+        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.hop_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.attn_gate = nn.Parameter(torch.zeros(1, dtype=torch.float32))
         self.hop_gate = nn.Parameter(torch.zeros(1, dtype=torch.float32))
 
     def forward(self, x: Tensor, beta: float) -> Tensor:
         gate_a = torch.sigmoid(self.attn_gate).to(x.dtype)
+        # 1D params broadcast from the right: [bsz, seq, dim] * [dim] -> [bsz, seq, dim]
         x = x + gate_a * self.attn_scale.to(x.dtype) * self.attn(self.attn_norm(x))
         gate_h = torch.sigmoid(self.hop_gate).to(x.dtype)
         x = x + gate_h * self.hop_scale.to(x.dtype) * self.hopfield(self.hop_norm(x), beta)
@@ -691,14 +692,14 @@ class BigramSmearGate(nn.Module):
         super().__init__()
         self.hash_vocab_size = hash_vocab_size
         self.hash_emb = nn.Embedding(hash_vocab_size, dim)
-        self.gate = nn.Parameter(torch.zeros(1, 1, dim))
+        self.gate = nn.Parameter(torch.zeros(dim))
         self.register_buffer("prime", torch.tensor(31, dtype=torch.int64), persistent=False)
 
     def forward(self, input_ids: Tensor) -> Tensor:
         padded = F.pad(input_ids, (1, 0), value=0)
         prev_ids = padded[:, :-1]
         hash_ids = (prev_ids * self.prime + input_ids) % self.hash_vocab_size
-        return self.hash_emb(hash_ids) * torch.sigmoid(self.gate).to(dtype=input_ids.dtype)
+        return self.hash_emb(hash_ids) * torch.sigmoid(self.gate).to(dtype=self.hash_emb.weight.dtype)
 
 
 class RAE(nn.Module):
@@ -832,8 +833,7 @@ def main() -> None:
 
     block_named_params = list(base_model.block.named_parameters())
     matrix_params = [p for name, p in block_named_params if p.ndim == 2 and not any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS)]
-    # Catch both 1D and 3D scalars/scales
-    scalar_params = [p for name, p in block_named_params if p.ndim != 2 or any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS)]
+    scalar_params = [p for name, p in block_named_params if p.ndim < 2 or any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS)]
 
     tok_params = [base_model.tok_emb.weight]
     if base_model.bigram_hash is not None:
